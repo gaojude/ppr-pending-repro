@@ -43,6 +43,7 @@ async function runOnce(browser, i) {
   // Use instant() to freeze at the PPR shell state — same as the
   // testing API used by vercel-site's screenshot tool.
   await instant(page, async () => {
+    await new Promise((r) => setTimeout(r, 1000));
     // Client-navigate from Page A → Dashboard (Page B)
     await page.evaluate(() => {
       // @ts-ignore
@@ -53,56 +54,56 @@ async function runOnce(browser, i) {
     result = await page.evaluate(async () => {
       const t0 = performance.now();
 
-      for (let i = 0; i < 500; i++) {
-        await new Promise((r) => setTimeout(r, 3));
+      const POLL_MS = 50;
+      const TIMEOUT_MS = 10_000;
+      let sawSkeleton = false;
+      let sawInnerFb = false;
+
+      const vis = (el) =>
+        el &&
+        !el.closest("[hidden]") &&
+        getComputedStyle(el).display !== "none";
+
+      while (performance.now() - t0 < TIMEOUT_MS) {
+        await new Promise((r) => setTimeout(r, POLL_MS));
 
         const skeleton = document.querySelector('[data-testid="SKELETON"]');
         const pageB = document.querySelector('[data-testid="PAGE-B"]');
         const innerFb = document.querySelector(
-          '[data-testid="INNER-FALLBACK"]'
+          '[data-testid="INNER-FALLBACK"]',
         );
         const cached = document.querySelector('[data-testid="CACHED-THING"]');
 
-        const vis = (el) =>
-          el && !el.closest("[hidden]") && getComputedStyle(el).display !== "none";
+        if (vis(skeleton)) sawSkeleton = true;
+        if (vis(innerFb)) sawInnerFb = true;
 
         if (vis(pageB)) {
           return {
-            outcome: "PAGE-B",
+            outcome: sawSkeleton ? "SKEL→PAGE-B" : "PAGE-B",
             hasCached: vis(cached),
             hasInnerFb: vis(innerFb),
-            t: performance.now() - t0,
-          };
-        }
-        if (vis(skeleton)) {
-          // Wait a bit to confirm it's stable (not transitioning)
-          await new Promise((r) => setTimeout(r, 200));
-          const pageB2 = document.querySelector('[data-testid="PAGE-B"]');
-          if (pageB2 && getComputedStyle(pageB2).display !== "none") {
-            return {
-              outcome: "SKEL→PAGE-B",
-              t: performance.now() - t0,
-            };
-          }
-          return {
-            outcome: "SKELETON",
-            hasInnerFb: vis(
-              document.querySelector('[data-testid="INNER-FALLBACK"]')
-            ),
-            t: performance.now() - t0,
-          };
-        }
-
-        if (vis(innerFb)) {
-          return {
-            outcome: "INNER-FALLBACK",
+            sawSkeleton,
+            sawInnerFb,
             t: performance.now() - t0,
           };
         }
       }
-      return { outcome: "TIMEOUT", t: performance.now() - t0 };
+
+      // Timed out — report what we last saw.
+      return {
+        outcome: sawSkeleton
+          ? "SKELETON"
+          : sawInnerFb
+            ? "INNER-FALLBACK"
+            : "TIMEOUT",
+        sawSkeleton,
+        sawInnerFb,
+        t: performance.now() - t0,
+      };
     });
   });
+
+  await new Promise((r) => setTimeout(r, 3000));
 
   await ctx.close();
   return result;
@@ -111,10 +112,9 @@ async function runOnce(browser, i) {
 // ─── Main ────────────────────────────────────────────────────────────────
 
 const ver = JSON.parse(
-  await (await import("fs/promises")).readFile(
-    "/tmp/ppr-use-cache-repro/node_modules/next/package.json",
-    "utf8"
-  )
+  await (
+    await import("fs/promises")
+  ).readFile("/tmp/ppr-use-cache-repro/node_modules/next/package.json", "utf8"),
 ).version;
 
 console.log(`
@@ -139,7 +139,7 @@ ${"═".repeat(70)}
     🔄 SKEL→PAGE  = skeleton then resolved (would mean timer-only delay)
 `);
 
-const browser = await chromium.launch();
+const browser = await chromium.launch({ headless: false });
 
 // Pre-warm: compile both routes
 const warmCtx = await browser.newContext();
@@ -169,7 +169,7 @@ for (let i = 1; i <= ITERS; i++) {
   if (r.hasInnerFb) extra.push("+inner-fallback");
 
   console.log(
-    `  [${String(i).padStart(2)}]  ${icon} ${r.outcome.padEnd(14)}  @${String(Math.round(r.t)).padStart(4)}ms  ${extra.join(" ")}`
+    `  [${String(i).padStart(2)}]  ${icon} ${r.outcome.padEnd(14)}  @${String(Math.round(r.t)).padStart(4)}ms  ${extra.join(" ")}`,
   );
 }
 
