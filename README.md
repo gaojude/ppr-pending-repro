@@ -1,36 +1,87 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# "use cache" inside Suspense blocks client navigation (dev-only)
 
-## Getting Started
+## The Bug
 
-First, run the development server:
+A server component using `"use cache"` wrapped in `<Suspense>` can block
+an **entire client navigation** in dev mode — even though Suspense should
+contain the suspension.
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+```
+Page A  →  router.push('/dashboard')  →  Page B (blocked!)
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Expected vs Actual
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+**Expected:**
+```
+<Suspense fallback={<Loading/>}>     catches any suspension
+  <CachedThing/>                      "use cache" component
+</Suspense>
+{children}                            page renders independently
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+**Actual (dev, cache miss):**
+```
+<ClientShell>                         client component boundary
+  <div>                                Flight serializes as ONE prop chunk
+    <Suspense>                         never emitted (chunk halted first)
+      <CachedThing/>                   setTimeout(0) from "use cache"
+    </Suspense>
+    {children}                         never reached (same chunk)
+  </div>
+</ClientShell>
+→ entire chunk = HALTED Lazy → outer Suspense catches → SKELETON
+```
 
-## Learn More
+## Root Cause
 
-To learn more about Next.js, take a look at the following resources:
+`next/src/server/use-cache/use-cache-wrapper.ts:756`:
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```js
+// DEV ONLY
+if (process.env.NODE_ENV === 'development' && outerWorkUnitStore.cacheSignal) {
+  await new Promise((resolve) => setTimeout(resolve))
+}
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+On `"use cache"` miss in dev:
+1. `setTimeout(0)` is awaited
+2. PPR's abort timers (`_idleStart`-patched, same timer phase) fire first
+3. Flight's serialization task aborts **at the chunk level**
+4. Everything in that chunk — including `<Suspense>` and `{children}` — halts
+5. Client receives a HALTED Lazy → suspension bubbles to the outer boundary
 
-## Deploy on Vercel
+Flight has **no concept of Suspense** — it's just serializing a JSON-like tree.
+When serialization aborts mid-tree, siblings are lost regardless of boundaries.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Why Production Is Fine
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+In production, `"use cache"` misses don't go through `setTimeout(0)`.
+Cache fills and postpones happen synchronously during Flight serialization,
+so Suspense boundaries are emitted to the stream and properly contain
+any suspended children on the client.
+
+## Running
+
+```bash
+# Terminal 1
+npx next dev --turbopack --port 3900
+
+# Terminal 2
+node test.mjs
+
+# To force cache misses (more SKELETONs):
+rm -rf .next && npx next dev --turbopack --port 3900
+```
+
+## What You'll See
+
+```
+  [ 1]  ✅ PAGE-B          @ 130ms
+  [ 2]  ⏳ SKELETON        @ 340ms    ← BLOCKED despite Suspense!
+  [ 3]  ✅ PAGE-B          @ 125ms
+  [ 4]  ⏳ SKELETON        @ 335ms
+  ...
+  BUG REPRODUCED
+  Inner Suspense fallback shown 0 times — it never makes it to the client.
+```
